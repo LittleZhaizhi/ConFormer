@@ -1,0 +1,15 @@
+# Dataset files are mounted or downloaded in the runtime environment; do not commit them.
+data/
+kaggle/working/
+
+# Training outputs
+logs/
+saved_models/
+*.pt
+*.pth
+*.ckpt
+
+# Local Python/cache files
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
