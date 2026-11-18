@@ -8,6 +8,7 @@ import pandas as pd
 
 def get_dataloaders_from_index_data(
     data_dir, tod=False, dow=False, dom=False, batch_size=64, log=None, shift = False, in_steps = 12, out_steps = 12,
+    *, tokyo_external=False,
 ):  
     if os.path.isfile(os.path.join(data_dir, "data.npz")) == True:
         if shift:
@@ -26,21 +27,34 @@ def get_dataloaders_from_index_data(
         dow_tiled = np.tile(df.index.dayofweek, [1, num_nodes, 1]).transpose((2, 1, 0))
         day_of_week = dow_tiled 
         feature_list.append(day_of_week)
-        # external = np.load(os.path.join(data_dir, "external.npz"))["data"].astype(np.float32)
-        # data = np.concatenate(feature_list + [external], axis=-1)[:, :cfg['num_nodes']]
         data = np.concatenate(feature_list, axis=-1)
         np.savez(os.path.join(data_dir, f"data.npz"), data=data)
 
 
-    features = [0]
-    if tod:
-        features.append(1)
-    if dow:
-        features.append(2)
-        # data[..., 2] = np.where(data[..., 2] >= 5, 1, 0)
-    # if dom:
-    #     features.append(3)
-    data = data[..., features]
+    # TKY reproduction: keep traffic and calendar channels before external events.
+    if tokyo_external:
+        if data.ndim != 3 or data.shape[-1] < 3:
+            raise ValueError("Tokyo data must contain traffic, time-of-day and day-of-week channels")
+        external_path = os.path.join(data_dir, "external.npz")
+        with np.load(external_path, allow_pickle=False) as archive:
+            external = archive["data"]
+        if external.shape != (*data.shape[:2], 2):
+            raise ValueError(
+                f"Expected Tokyo external channels with shape {(*data.shape[:2], 2)}, "
+                f"got {external.shape} in {external_path}"
+            )
+        if not np.all((external == 0) | (external == 1)):
+            raise ValueError(f"Expected binary Tokyo external channels in {external_path}")
+        # The original loader's commented concatenation implies accident, then regulation.
+        # The release does not label these two channels or give their report times.
+        data = np.concatenate((data[..., :3], external), axis=-1, dtype=np.float32)
+    else:
+        features = [0]
+        if tod:
+            features.append(1)
+        if dow:
+            features.append(2)
+        data = data[..., features]
 
     if os.path.isfile(os.path.join(data_dir, f"index.npz")) == False:
         idx1 = np.arange(len(data) - in_steps - out_steps)
@@ -73,11 +87,11 @@ def get_dataloaders_from_index_data(
     y_test_index = vrange(test_index[:, 1], test_index[:, 2])
 
     x_train = data[x_train_index]
-    y_train = data[y_train_index][..., :1]
+    y_train = data[y_train_index, :, :1]
     x_val = data[x_val_index]
-    y_val = data[y_val_index][..., :1]
+    y_val = data[y_val_index, :, :1]
     x_test = data[x_test_index]
-    y_test = data[y_test_index][..., :1]
+    y_test = data[y_test_index, :, :1]
 
     scaler = StandardScaler(mean=x_train[..., 0].mean(), std=x_train[..., 0].std())
 

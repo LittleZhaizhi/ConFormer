@@ -29,7 +29,8 @@ TKY:
     dow_embedding_dim: 32
     acc_embedding_dim: 32
     reg_embedding_dim: 32
-    adaptive_embedding_dim: 32
+    # Node embeddings use the constructor's node_embedding_dim argument.
+    node_embedding_dim: 32
     num_heads: 2
     num_layers: 3
     dropout: 0.1

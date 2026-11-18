@@ -13,6 +13,7 @@ import json
 import sys
 import glob
 import copy
+from pathlib import Path
 
 sys.path.append("..")
 from lib.utils import (
@@ -213,6 +214,51 @@ def test_model(model, testset_loader, log=None):
     print_log("Inference time: %.2f s" % (end - start), log=log)
 
 
+# TKY reproduction: align the released road graph with the 1843 traffic links.
+def load_tokyo_support(data_path, num_nodes):
+    adjacency_path = os.path.join(data_path, "adj.npy")
+    adjacency = np.load(adjacency_path, allow_pickle=False)
+    if adjacency.shape == (2841, 2841):
+        index_path = Path(__file__).with_name("tokyo_link_idx.csv")
+        road_indices = np.loadtxt(index_path, dtype=np.intp, ndmin=1)
+        if (
+            road_indices.shape != (num_nodes,)
+            or np.unique(road_indices).size != num_nodes
+            or np.any(road_indices < 0)
+            or np.any(road_indices >= adjacency.shape[0])
+        ):
+            raise ValueError(f"Invalid Tokyo road indices in {index_path}")
+        adjacency = adjacency[np.ix_(road_indices, road_indices)]
+
+    if adjacency.shape != (num_nodes, num_nodes):
+        raise ValueError(
+            f"Expected a {num_nodes} x {num_nodes} Tokyo road graph, "
+            f"got {adjacency.shape} from {adjacency_path}"
+        )
+    adjacency = np.asarray(adjacency, dtype=np.float32)
+    if not np.isfinite(adjacency).all():
+        raise ValueError(f"Non-finite values in the Tokyo road graph: {adjacency_path}")
+    return torch.from_numpy(adjacency)
+
+
+def normalize_incoming_weights(support):
+    # ConFormer uses "nvc,vw->nwc", so column w contains the weights received by w.
+    column_sums = support.sum(dim=0, keepdim=True)
+    if not torch.isfinite(column_sums).all() or (column_sums <= 0).any():
+        raise ValueError("Incoming normalization requires a finite positive sum for every column")
+    return support / column_sums
+
+
+def build_training_model(dataset, data_path, model_args, *, normalize_incoming=True):
+    model_args = dict(model_args)
+    if dataset == "TKY":
+        support = load_tokyo_support(data_path, model_args["num_nodes"])
+        if normalize_incoming:
+            support = normalize_incoming_weights(support)
+        model_args["supports"] = [support]
+    return ConFormer(**model_args)
+
+
 if __name__ == "__main__":
     # -------------------------- set running environment ------------------------- #
 
@@ -220,6 +266,12 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--dataset", type=str, default="tky")
     parser.add_argument("-g", "--gpu_num", type=int, default=1)
     parser.add_argument("-m", "--mode", type=str, default='train')
+    parser.add_argument(
+        "--normalize-incoming",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize the fixed TKY road graph by incoming weight sums (default: enabled)",
+    )
     args = parser.parse_args()
 
     seed = 2024
@@ -241,7 +293,9 @@ if __name__ == "__main__":
 
     # -------------------------------- load model -------------------------------- #
 
-    model = ConFormer(**cfg["model_args"])
+    model = build_training_model(
+        dataset, data_path, cfg["model_args"], normalize_incoming=args.normalize_incoming
+    )
 
     # ------------------------------- make log file ------------------------------ #
 
@@ -266,6 +320,7 @@ if __name__ == "__main__":
         data_path,
         tod=cfg.get("time_of_day"),
         dow=cfg.get("day_of_week"),
+        tokyo_external=dataset == "TKY",
         batch_size=cfg.get("batch_size", 64),
         log=log,
         in_steps=cfg.get("in_steps", 12),
