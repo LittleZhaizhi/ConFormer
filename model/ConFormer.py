@@ -202,6 +202,7 @@ class ConFormer(nn.Module):
         supports=1,
         use_mixed_proj=True,
         fast=False,
+        event_vocab_size=2,
     ):
         super().__init__()
 
@@ -251,7 +252,7 @@ class ConFormer(nn.Module):
                 nn.Parameter(torch.empty(num_nodes, node_embedding_dim))
             )
         if acc_embedding_dim > 0:
-            self.acc_embedding = nn.Embedding(2, acc_embedding_dim)
+            self.acc_embedding = nn.Embedding(event_vocab_size, acc_embedding_dim)
         if reg_embedding_dim > 0:
             self.reg_embedding = nn.Embedding(2, reg_embedding_dim)
 
@@ -271,9 +272,17 @@ class ConFormer(nn.Module):
             ]
         )
 
-    def forward(self, x):
-        # x: (batch_size, in_steps, num_nodes, input_dim)
+    def forward(self, x, *, event_ids=None):
+        """Predict traffic with optional per-node event IDs for XTraffic."""
+        # x: (batch_size, in_steps, num_nodes, input channels)
         batch_size = x.shape[0]
+        if event_ids is not None:
+            if self.acc_embedding_dim <= 0:
+                raise ValueError("Explicit event IDs require an enabled event embedding")
+            if event_ids.shape != (batch_size, self.num_nodes):
+                raise ValueError("event_ids must have shape (batch_size, num_nodes)")
+            if event_ids.dtype not in (torch.int32, torch.int64) or event_ids.device != x.device:
+                raise ValueError("event_ids must be an integer tensor on the input device")
         features = []
         if self.tod_embedding_dim > 0:
             tod_emb = self.tod_embedding(
@@ -295,8 +304,12 @@ class ConFormer(nn.Module):
             node_emb = F.dropout(node_emb, self.adp_dropout, training=self.training)
             features.append(node_emb)
         if self.acc_embedding_dim > 0:
-            acc_emb = self.acc_embedding((x[..., 3].sum(1) > 0).long())
-            features.append(acc_emb)
+            if event_ids is None:
+                if self.acc_embedding.num_embeddings != 2 or x.shape[-1] < 4:
+                    raise ValueError("This model requires explicit per-node event_ids")
+                # The original Tokyo path uses presence over the history window.
+                event_ids = (x[..., 3].sum(dim=1) > 0).long()
+            features.append(self.acc_embedding(event_ids))
         if self.reg_embedding_dim > 0:
             reg_emb = self.reg_embedding((x[..., 4].sum(1) > 0).long())
             features.append(reg_emb)

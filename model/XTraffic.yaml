@@ -1,0 +1,32 @@
+# Alameda configuration shared by the two research branches.
+region: Alameda
+model: m0
+
+# Null uses the IGSTGNN release's scale flag for the target as well.
+targets_normalized: null
+# Use a numeric sentinel only after confirming it in original traffic units.
+missing_traffic_value: null
+
+road_graph:
+  transpose: false
+  normalize_incoming: false
+
+model_args:
+  num_nodes: 521
+  in_steps: 12
+  out_steps: 12
+  steps_per_day: 288
+  input_dim: 1
+  output_dim: 1
+  input_embedding_dim: 32
+  tod_embedding_dim: 32
+  dow_embedding_dim: 32
+  node_embedding_dim: 32
+  acc_embedding_dim: 32
+  reg_embedding_dim: 0
+  num_heads: 2
+  num_layers: 3
+  dropout: 0.1
+  adp_dropout: 0.2
+  dow_dropout: 0.1
+  tod_dropout: 0.0
