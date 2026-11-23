@@ -1,6 +1,6 @@
 # Alameda configuration shared by the two research branches.
 region: Alameda
-model: m0
+model: m1
 
 # Null uses the IGSTGNN release's scale flag for the target as well.
 targets_normalized: null
