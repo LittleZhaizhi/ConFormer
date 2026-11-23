@@ -9,7 +9,7 @@ missing_traffic_value: null
 
 road_graph:
   transpose: false
-  normalize_incoming: false
+  normalize_incoming: true
 
 model_args:
   num_nodes: 521

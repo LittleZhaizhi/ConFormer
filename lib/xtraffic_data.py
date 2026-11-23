@@ -223,6 +223,7 @@ def _graph_summary(matrix):
         "nonzero_weights": int(np.count_nonzero(matrix)),
         "row_sum_range": [float(row_sums.min()), float(row_sums.max())],
         "column_sum_range": [float(column_sums.min()), float(column_sums.max())],
+        "zero_columns": int(np.count_nonzero(column_sums == 0)),
         "sha256": hashlib.sha256(matrix.tobytes()).hexdigest(),
     }
 
@@ -243,10 +244,16 @@ def read_road_graph(data_dir, num_nodes, *, transpose=False, normalize_incoming=
     if transpose:
         adjacency = adjacency.T
     if normalize_incoming:
-        column_sums = adjacency.sum(axis=0)
-        if not np.isfinite(column_sums).all() or (column_sums <= 0).any():
-            raise ValueError("Incoming normalization requires positive finite column sums")
-        adjacency = adjacency / column_sums
+        column_sums = adjacency.sum(axis=0, dtype=np.float64)
+        if not np.isfinite(column_sums).all():
+            raise ValueError("Incoming normalization requires finite column sums")
+        # Nodes with no incoming edges keep their zero columns.
+        adjacency = np.divide(
+            adjacency,
+            column_sums,
+            out=np.zeros_like(adjacency, dtype=np.float64),
+            where=column_sums > 0,
+        )
 
     adjacency = np.ascontiguousarray(adjacency, dtype=np.float32)
     if not np.isfinite(adjacency).all():
