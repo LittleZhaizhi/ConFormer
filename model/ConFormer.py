@@ -203,6 +203,7 @@ class ConFormer(nn.Module):
         use_mixed_proj=True,
         fast=False,
         event_vocab_size=2,
+        isolate_event_init=False,
     ):
         super().__init__()
 
@@ -252,7 +253,15 @@ class ConFormer(nn.Module):
                 nn.Parameter(torch.empty(num_nodes, node_embedding_dim))
             )
         if acc_embedding_dim > 0:
-            self.acc_embedding = nn.Embedding(event_vocab_size, acc_embedding_dim)
+            if isolate_event_init:
+                # XTraffic builds parameters on CPU. The event table must not
+                # advance the RNG used to initialize the remaining shared layers.
+                with torch.random.fork_rng(devices=[]):
+                    event_seed = torch.initial_seed() ^ 0x4556454E54
+                    torch.default_generator.manual_seed(event_seed)
+                    self.acc_embedding = nn.Embedding(event_vocab_size, acc_embedding_dim)
+            else:
+                self.acc_embedding = nn.Embedding(event_vocab_size, acc_embedding_dim)
         if reg_embedding_dim > 0:
             self.reg_embedding = nn.Embedding(2, reg_embedding_dim)
 

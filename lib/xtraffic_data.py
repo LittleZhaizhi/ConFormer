@@ -13,7 +13,8 @@ import numpy as np
 
 EVENT_TYPES = ("hazard", "other", "accident", "breakdown", "police", "weather")
 EVENT_TYPE_IDS = {name: index for index, name in enumerate(EVENT_TYPES, start=1)}
-EVENT_VOCAB_SIZES = {"m0": 2, "m1": len(EVENT_TYPES) + 1}
+MODEL_VARIANT = "m1"
+EVENT_VOCAB_SIZE = len(EVENT_TYPES) + 1
 CALENDAR_ATOL = 1e-4
 
 
@@ -172,13 +173,12 @@ class XTrafficDataset:
     """Read one prepared window at a time without making a second copy of the release."""
 
     def __init__(
-        self, samples, event_masks, event_types, encoding, steps_per_day,
+        self, samples, event_masks, event_types, steps_per_day,
         release_scale, targets_normalized, training_scale, missing_value,
     ):
         self.samples = samples
         self.event_masks = event_masks
         self.event_types = event_types
-        self.encoding = encoding
         self.steps_per_day = steps_per_day
         self.release_scale = release_scale
         self.targets_normalized = targets_normalized
@@ -204,7 +204,7 @@ class XTrafficDataset:
             *self.release_scale[1:], self.missing_value,
         )
         mask = self.event_masks[sample_id]
-        code = 1 if self.encoding == "m0" else self.event_types[sample_id]
+        code = self.event_types[sample_id]
         return {
             "sample_id": int(sample_id),
             "x": x,
@@ -298,9 +298,8 @@ def prepare_xtraffic(data_dir, output_dir, config):
     """Validate the trusted release and prepare shared splits, scale and support."""
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
-    encoding = config["model"]
-    if encoding not in EVENT_VOCAB_SIZES:
-        raise ValueError(f"Unknown XTraffic model variant: {encoding}")
+    if config["model"] != MODEL_VARIANT:
+        raise ValueError(f"This branch expects XTraffic model: {MODEL_VARIANT}")
     args = config["model_args"]
     num_nodes = args["num_nodes"]
     in_steps = args["in_steps"]
@@ -416,7 +415,7 @@ def prepare_xtraffic(data_dir, output_dir, config):
     save_json(audit_path, report)
     save_json(output_dir / "split_manifest.json", manifest)
     dataset = XTrafficDataset(
-        samples, masks, types, encoding, steps_per_day, release_scale,
+        samples, masks, types, steps_per_day, release_scale,
         targets_normalized, scale, missing_value,
     )
     return dataset, splits, adjacency, report
