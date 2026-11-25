@@ -24,10 +24,16 @@
 3. 每完成一项可解释的小改动就提交一次，并在实验记录中写明提交号、数据版本、配置和运行结果。
 4. 在含数据集的远程环境运行实验，代码改动保存在相应的研究分支。大数据文件、密钥、日志和权重不要推送到公开代码仓库。
 
-## Alameda 数据与模型检查
+## Alameda 数据检查与正式训练
 
 在项目根目录运行，数据目录指向可信的 IGSTGNN Alameda 发布包。
 
     python -m model.prepare_xtraffic --data-dir data/xtraffic/Alameda --output-dir logs/alameda-prepare
 
-默认读取当前分支的 XTraffic 配置，生成共用划分清单、训练尺度和数据核验报告。可附加 --build-model 检查模型构造和一次固定图传播前向。训练前核对两组读取的数据指纹、划分、掩码和图设置一致。
+默认读取当前分支的 XTraffic 配置，生成划分清单、训练尺度和数据核验报告。
+
+在项目根目录启动本分支的正式训练：
+
+    python model/train_xtraffic.py --data-dir data/xtraffic/Alameda --device cuda:0 --expect-model m0 --seed 2024
+
+每次训练用本分支的事件编码及事件表，独立保存日志、初始主干、最佳权重和测试预测。相同环境和种子下，事件表初始化与后续主干初始化使用隔离的 RNG 状态。复跑归档实验的随机起点时，两组可选用同一份训练前的初始主干文件，通过 --initial-backbone 指定；不要用最佳权重 best.pt。配对结果在两组训练后比较，核对报告中的主干指纹、训练设置及逐轮样本顺序。

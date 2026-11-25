@@ -1,8 +1,7 @@
-"""Train one Alameda variant and archive a reproducible M0/M1 seed pair."""
+"""Train this branch on Alameda and archive its test predictions."""
 
 import argparse
 import hashlib
-import json
 from math import sqrt
 from pathlib import Path
 import sys
@@ -17,11 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from lib.utils import print_log, seed_everything
-from lib.xtraffic_data import prepare_xtraffic, save_json
+from lib.xtraffic_data import MODEL_VARIANT, prepare_xtraffic, save_json
 from model.prepare_xtraffic import build_model, make_dataloaders
 
 
-SEEDS = (2024, 2025, 2026)
 LEARNING_RATE = 0.001
 EVENT_WEIGHT = "acc_embedding.weight"
 
@@ -47,31 +45,25 @@ def backbone_digest(state):
     return digest.hexdigest()
 
 
-def prepare_initial_weights(model, reference_dir, protocol, run_dir):
-    """Save M0's start or copy that exact backbone into the independently built M1."""
+def archive_initial_backbone(model, initial_source, run_dir):
+    """Load an optional compatible initialization, then archive this run's own copy."""
     backbone = backbone_state(model)
-    if reference_dir is None:
-        initial_path = run_dir / "initial_backbone.pt"
-        torch.save(backbone, initial_path)
-        return backbone_digest(backbone), initial_path, []
+    if initial_source is not None:
+        initial = torch.load(initial_source, map_location="cpu", weights_only=True)
+        if not isinstance(initial, dict) or initial.keys() != backbone.keys():
+            raise ValueError("Expected an initial backbone file with only the shared tensors")
+        for name, tensor in initial.items():
+            expected = backbone[name]
+            if (not isinstance(tensor, torch.Tensor)
+                    or tensor.shape != expected.shape or tensor.dtype != expected.dtype):
+                raise ValueError(f"Incompatible initial backbone tensor: {name}")
+        event_weight = model.state_dict()[EVENT_WEIGHT]
+        model.load_state_dict({**initial, EVENT_WEIGHT: event_weight}, strict=True)
+        backbone = backbone_state(model)
 
-    reference = json.loads((reference_dir / "run_summary.json").read_text(encoding="utf-8"))
-    if reference["model"] != "m0" or reference["protocol"] != protocol:
-        raise ValueError("M0 reference must have the same seed, data, graph and run settings")
-
-    initial_path = reference_dir / "initial_backbone.pt"
-    initial = torch.load(initial_path, map_location="cpu", weights_only=True)
-    if initial.keys() != backbone.keys() or backbone_digest(initial) != reference["initial_backbone_sha256"]:
-        raise ValueError("M0 initial backbone differs from its recorded state")
-    for name, tensor in initial.items():
-        if tensor.shape != backbone[name].shape or tensor.dtype != backbone[name].dtype:
-            raise ValueError(f"M0 initial backbone is incompatible at {name}")
-
-    model.load_state_dict({**initial, EVENT_WEIGHT: model.state_dict()[EVENT_WEIGHT]}, strict=True)
-    copied_digest = backbone_digest(backbone_state(model))
-    if copied_digest != reference["initial_backbone_sha256"]:
-        raise RuntimeError("The shared initial backbone was not copied exactly")
-    return copied_digest, initial_path, reference["epochs"]
+    initial_path = run_dir / "initial_backbone.pt"
+    torch.save(backbone, initial_path)
+    return backbone_digest(backbone), initial_path
 
 
 class ErrorTotals:
@@ -156,15 +148,13 @@ def evaluate(model, loader, scale, device, *, archive_path=None, event_type_ids=
     return metrics
 
 
-def train_to_best(model, loaders, scale, device, args, reference_epochs, run_dir, log):
+def train_to_best(model, loaders, scale, device, args, run_dir, log):
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     checkpoint = run_dir / "best.pt"
     epochs = []
     best = None
     for epoch in range(1, args.max_epochs + 1):
         training, order_digest = train_epoch(model, loaders["train"], optimizer, scale, device)
-        if epoch <= len(reference_epochs) and order_digest != reference_epochs[epoch - 1]["train_order_sha256"]:
-            raise RuntimeError(f"Epoch {epoch} did not use the same training order as M0")
         validation = evaluate(model, loaders["val"], scale, device)
         record = {
             "epoch": epoch,
@@ -213,19 +203,20 @@ def run(config, args, device, run_dir, log):
               f"SHA-256 {graph['sha256']}", log=log)
 
     seed_everything(args.seed)
-    model = build_model(config, adjacency, device)
-    initial_hash, initial_path, reference_epochs = prepare_initial_weights(
-        model, args.m0_run, protocol, run_dir,
+    model = build_model(
+        config, adjacency, device,
+        isolate_event_init=args.initial_backbone is None,
     )
+    initial_hash, initial_path = archive_initial_backbone(model, args.initial_backbone, run_dir)
     print_log(f"Initial backbone SHA-256: {initial_hash} ({initial_path})", log=log)
     print_log(f"Event table: {list(model.acc_embedding.weight.shape)}", log=log)
 
-    # Model initialization consumes different numbers of draws in the two branches.
+    # Start the training RNG at the configured seed after model initialization.
     seed_everything(args.seed)
     loaders = make_dataloaders(dataset, splits, args.batch_size, args.seed)
     start = perf_counter()
     checkpoint, best, epochs = train_to_best(
-        model, loaders, scale, device, args, reference_epochs, run_dir, log,
+        model, loaders, scale, device, args, run_dir, log,
     )
     training_seconds = perf_counter() - start
 
@@ -244,8 +235,9 @@ def run(config, args, device, run_dir, log):
         "protocol": protocol,
         "initial_backbone_sha256": initial_hash,
         "initial_backbone": str(initial_path),
-        "paired_m0_run": str(args.m0_run) if args.m0_run is not None else None,
-        "overlapping_epochs_verified": min(len(reference_epochs), len(epochs)),
+        "initial_backbone_source": (
+            str(args.initial_backbone) if args.initial_backbone is not None else None
+        ),
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "training_seconds": training_seconds,
         "epochs": epochs,
@@ -255,8 +247,6 @@ def run(config, args, device, run_dir, log):
         "test_predictions": str(archive),
     })
     print_log(f"PASS: {config['model'].upper()} seed {args.seed}. Report: {summary}", log=log)
-    if config["model"] == "m0":
-        print_log(f"M1 reference (--m0-run): {run_dir}", log=log)
 
 
 def positive_int(value):
@@ -270,12 +260,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--expect-model", choices=("m0", "m1"), required=True)
-    parser.add_argument("--seed", choices=SEEDS, type=int, required=True)
+    parser.add_argument("--expect-model", choices=(MODEL_VARIANT,), required=True)
+    parser.add_argument("--seed", type=int, default=2024)
     parser.add_argument("--batch-size", type=positive_int, default=16)
     parser.add_argument("--max-epochs", type=positive_int, default=100)
     parser.add_argument("--patience", type=positive_int, default=15)
-    parser.add_argument("--m0-run", type=Path, help="Completed formal M0 directory for this seed")
+    parser.add_argument(
+        "--initial-backbone", type=Path,
+        help="Optional shared, pre-training initial_backbone.pt for an exact initialization replay",
+    )
     args = parser.parse_args()
 
     config = yaml.safe_load((ROOT / "model" / "XTraffic.yaml").read_text(encoding="utf-8"))
@@ -283,12 +276,12 @@ def main():
         parser.error(f"XTraffic.yaml selects {config['model']}, expected {args.expect_model}")
     if not config["road_graph"]["normalize_incoming"]:
         parser.error("Alameda training requires the verified incoming-normalized fixed graph")
-    if (config["model"] == "m1") != (args.m0_run is not None):
-        parser.error("--m0-run is required for M1 and only used for M1")
-    if args.m0_run is not None:
-        args.m0_run = args.m0_run.resolve()
-        if not (args.m0_run / "run_summary.json").is_file():
-            parser.error("--m0-run must point to a completed M0 formal run")
+    if not 0 <= args.seed < 2**32:
+        parser.error("--seed must be between 0 and 4294967295")
+    if args.initial_backbone is not None:
+        args.initial_backbone = args.initial_backbone.resolve()
+        if not args.initial_backbone.is_file():
+            parser.error("--initial-backbone must point to an existing initialization file")
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
