@@ -37,3 +37,9 @@
     python model/train_xtraffic.py --data-dir data/xtraffic/Alameda --device cuda:0 --expect-model m0 --seed 2024
 
 每次训练用本分支的事件编码及事件表，独立保存日志、初始主干、最佳权重和测试预测。相同环境和种子下，事件表初始化与后续主干初始化使用隔离的 RNG 状态。复跑归档实验的随机起点时，两组可选用同一份训练前的初始主干文件，通过 --initial-backbone 指定；不要用最佳权重 best.pt。配对结果在两组训练后比较，核对报告中的主干指纹、训练设置及逐轮样本顺序。
+
+配对核验及可选的逐样本误差细分由同一工具完成：
+
+    python model/compare_xtraffic_runs.py --m0-summary logs/<m0-run>/run_summary.json --m1-summary logs/<m1-run>/run_summary.json
+
+当两份报告引用的 `test_predictions.npz` 可读取时，工具还会核对样本、真值、有效位置、事件节点掩码和类别，并汇总全区域、事件节点、其余节点、类别及预测时距的 MAE/RMSE 与覆盖数。报告里的预测文件路径不可用时，原有报告级配对核验仍可单独使用；也可显式传入 `--m0-predictions` 和 `--m1-predictions`。
