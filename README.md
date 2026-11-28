@@ -20,111 +20,31 @@ Traffic prediction remains a fundamental challenge in spatiotemporal data mining
 * **Multi-scale Temporal Modeling**: Captures both short-term and long-term traffic patterns
 * **Comprehensive Embeddings**: Supports time-of-day, day-of-week, accident, and regional embeddings
 
-## Installation
+## Standard Tokyo model in this repository
 
-### Requirements
+This fork's main branch maintains the full dual-axis Tokyo ConFormer baseline.
+It keeps the released 6-step history and forecast windows, uses spatial and
+temporal attention, and supplies the graph condition directly to K and V.
+The upstream implementation is available in [the authors' repository](https://github.com/Dreamzz5/ConFormer).
 
-* Python >= 3.7
-* PyTorch >= 1.8.0
-* NumPy
-* Pandas
-* PyYAML
-* Matplotlib
-* torchinfo
+Install Python 3.10+, PyTorch 2.3+, NumPy, Pandas, PyTables, PyYAML and timm
+(1.x). The school server baseline used an NVIDIA H100 and PyTorch 2.5.1.
+Use a PyTorch build suitable for the selected device.
 
-### Setup
+### Train
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd conformer
-
-# Install dependencies
-pip install torch numpy pandas pyyaml matplotlib torchinfo
-```
-
-## Project Structure
-
-```text
-conformer/
-├── model/
-│   ├── ConFormer.py          # Main model implementation
-│   ├── ConFormer.yaml        # Model configuration files
-│   └── train.py              # Training and evaluation script
-├── lib/
-│   ├── data_prepare.py       # Data loading and preprocessing
-│   ├── metrics.py            # Evaluation metrics (RMSE, MAE, MAPE)
-│   └── utils.py              # Utility functions
-├── data/                     # Dataset directory (to be created)
-│   ├── TKY/                  # Tokyo dataset
-│   ├── BA/                   # Bay Area dataset
-│   └── SD/                   # San Diego dataset
-├── logs/                     # Training logs (auto-created)
-├── saved_models/             # Saved model checkpoints (auto-created)
-└── README.md
-```
-
-## Quick Start
-
-### Data Preparation
-
-1. Download the datasets from the [Google Drive link](#datasets).
-2. Extract and place the datasets in the `data/` directory with the following structure:
-
-```text
-data/
-├── TKY/
-│   ├── data.npz
-│   └── index.npz
-├── BA/
-│   ├── data.npz
-│   └── index.npz
-└── SD/
-    ├── data.npz
-    └── index.npz
-```
-
-Depending on the dataset release, additional files such as `adj.npy`, `data.h5`, and `accident.h5` may also be included.
-
-### Training
-
-Train the model on a specific dataset:
+Place the released Tokyo bundle in the data directory with
+`data.h5` (or its generated `data.npz` cache), `external.npz`,
+`index.npz`, and `adj.npy`. From the repository root:
 
 ```bash
-cd model/
-python train.py -d <dataset> -g <gpu_id>
+python model/train.py --device cuda:0 --data-dir data/TKY --output-dir logs/tky-train-01
 ```
 
-**Parameters:**
-
-* `-d, --dataset`: Dataset name, e.g., `tky`, `ba`, `sd`
-* `-g, --gpu_num`: GPU ID to use, default: `1`
-* `-m, --mode`: Running mode, either `train` or `test`, default: `train`
-
-**Examples:**
-
-```bash
-# Train on the Tokyo dataset using GPU 0
-python train.py -d tky -g 0
-
-# Test on the Bay Area dataset using GPU 0
-python train.py -d ba -g 0 -m test
-```
-
-### Configuration
-
-Model hyperparameters can be configured in `model/ConFormer.yaml`.
-
-Key parameters include:
-
-* `in_steps`: Input sequence length
-* `out_steps`: Output prediction horizon
-* `num_heads`: Number of attention heads
-* `num_layers`: Number of transformer layers
-* `lr`: Learning rate
-* `batch_size`: Batch size
-* `max_epochs`: Maximum number of training epochs
-* `early_stop`: Early stopping patience
+Use a new run directory. Training reads `model/ConFormer.yaml`, selects
+`best.pt` by validation loss and writes the run log, protocol and training report.
+See the [Tokyo reproduction tools](reproduction/tokyo/README.md) for attention
+checks, checkpoint evaluation, paper comparison and optional remote monitoring.
 
 ## Datasets
 

@@ -1,416 +1,96 @@
+"""Train the full Tokyo ConFormer and save its best validation checkpoint."""
+
 import argparse
-import numpy as np
-import pandas as pd
-import os
-import torch
-import torch.nn as nn
 import datetime
-import time
-import matplotlib.pyplot as plt
-from torchinfo import summary
-import yaml
-import json
-import sys
-import glob
-import copy
 from pathlib import Path
+import sys
 
-sys.path.append("..")
-from lib.utils import (
-    MaskedMAELoss,
-    print_log,
-    seed_everything,
-    set_cpu_num,
-    CustomJSONEncoder,
+import numpy as np
+import torch
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from lib.utils import MaskedMAELoss, print_log, seed_everything
+from model.tokyo import (
+    DATA_DIR, SEED, build_model, device_for, load_config, load_tokyo, make_optimizer,
+    record_protocol, write_json,
 )
-from lib.metrics import RMSE_MAE_MAPE
-from lib.data_prepare import get_dataloaders_from_index_data
-from model.ConFormer import ConFormer
-
-# ! X shape: (B, T, N, C)
 
 
-@torch.no_grad()
-def eval_model(model, valset_loader, criterion):
-    model.eval()
-    batch_loss_list = []
-    for x_batch, y_batch in valset_loader:
-        x_batch = x_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
-
-        out_batch = model(x_batch)
-        out_batch = SCALER.inverse_transform(out_batch)
-        loss = criterion(out_batch, y_batch)
-        batch_loss_list.append(loss.item())
-
-    return np.mean(batch_loss_list)
-
-
-@torch.no_grad()
-def predict(model, loader):
-    model.eval()
-    y = []
-    out = []
-
-    for x_batch, y_batch in loader:
-        x_batch = x_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
-
-        out_batch = model(x_batch)
-        out_batch = SCALER.inverse_transform(out_batch)
-
-        out_batch = out_batch.cpu().numpy()
-        y_batch = y_batch.cpu().numpy()
-        out.append(out_batch)
-        y.append(y_batch)
-
-    out = np.vstack(out).squeeze()  # (samples, out_steps, num_nodes)
-    y = np.vstack(y).squeeze()
-
-    return y, out
-
-
-def train_one_epoch(
-    model, trainset_loader, optimizer, scheduler, criterion, clip_grad, log=None
-):
-    global cfg, global_iter_count, global_target_length
-
-    model.train()
-    batch_loss_list = []
-    for x_batch, y_batch in trainset_loader:
-        x_batch = x_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
-        out_batch = model(x_batch)
-        out_batch = SCALER.inverse_transform(out_batch)
-
-        loss = criterion(out_batch, y_batch)
-        batch_loss_list.append(loss.item())
-
-        optimizer.zero_grad()
-        loss.backward()
-        if clip_grad:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-        optimizer.step()
-
-    epoch_loss = np.mean(batch_loss_list)
-    scheduler.step()
-
-    return epoch_loss
-
-
-def train(
-    model,
-    trainset_loader,
-    valset_loader,
-    optimizer,
-    scheduler,
-    criterion,
-    clip_grad=0,
-    max_epochs=200,
-    early_stop=10,
-    verbose=1,
-    plot=False,
-    log=None,
-    save=None,
-):
-    model = model.to(DEVICE)
-
+def train(model, train_loader, val_loader, scaler, config, device, checkpoint, log):
+    criterion = MaskedMAELoss()
+    optimizer = make_optimizer(model, config)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer, milestones=config["milestones"], gamma=config["lr_decay_rate"]
+    )
+    best = None
     wait = 0
-    min_val_loss = np.inf
+    for epoch in range(1, config["max_epochs"] + 1):
+        model.train()
+        train_losses = []
+        for x, y in train_loader:
+            prediction = scaler.inverse_transform(model(x.to(device)))
+            loss = criterion(prediction, y.to(device))
+            train_losses.append(loss.item())
+            optimizer.zero_grad()
+            loss.backward()
+            if config.get("clip_grad"):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad"])
+            optimizer.step()
+        scheduler.step()
 
-    train_loss_list = []
-    val_loss_list = []
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for x, y in val_loader:
+                prediction = scaler.inverse_transform(model(x.to(device)))
+                val_losses.append(criterion(prediction, y.to(device)).item())
+        train_loss = float(np.mean(train_losses))
+        val_loss = float(np.mean(val_losses))
+        if not np.isfinite([train_loss, val_loss]).all():
+            raise RuntimeError(f"Non-finite loss at epoch {epoch}")
 
-    for epoch in range(max_epochs):
-        train_loss = train_one_epoch(
-            model, trainset_loader, optimizer, scheduler, criterion, clip_grad, log=log
-        )
-        train_loss_list.append(train_loss)
-
-        val_loss = eval_model(model, valset_loader, criterion)
-        val_loss_list.append(val_loss)
-
-        if (epoch + 1) % verbose == 0:
-            print_log(
-                datetime.datetime.now(),
-                "Epoch",
-                epoch + 1,
-                " \tTrain Loss = %.5f" % train_loss,
-                "Val Loss = %.5f" % val_loss,
-                log=log,
-            )
-
-        if val_loss < min_val_loss:
+        print_log(datetime.datetime.now(), f"Epoch {epoch}  Train Loss = {train_loss:.5f}"
+                  f" Val Loss = {val_loss:.5f}", log=log)
+        if best is None or val_loss < best["validation_loss"]:
+            torch.save(model.state_dict(), checkpoint)
+            best = {"epoch": epoch, "train_loss": train_loss, "validation_loss": val_loss}
             wait = 0
-            min_val_loss = val_loss
-            best_epoch = epoch
-            best_state_dict = copy.deepcopy(model.state_dict())
-            torch.save(best_state_dict, save)
         else:
             wait += 1
-            if wait >= early_stop:
+            if wait >= config["early_stop"]:
                 break
 
-    model.load_state_dict(best_state_dict)
-    train_rmse, train_mae, train_mape = RMSE_MAE_MAPE(*predict(model, trainset_loader))
-    val_rmse, val_mae, val_mape = RMSE_MAE_MAPE(*predict(model, valset_loader))
-
-    out_str = f"Early stopping at epoch: {epoch+1}\n"
-    out_str += f"Best at epoch {best_epoch+1}:\n"
-    out_str += "Train Loss = %.5f\n" % train_loss_list[best_epoch]
-    out_str += "Train RMSE = %.5f, MAE = %.5f, MAPE = %.5f\n" % (
-        train_rmse,
-        train_mae,
-        train_mape,
-    )
-    out_str += "Val Loss = %.5f\n" % val_loss_list[best_epoch]
-    out_str += "Val RMSE = %.5f, MAE = %.5f, MAPE = %.5f" % (
-        val_rmse,
-        val_mae,
-        val_mape,
-    )
-    print_log(out_str, log=log)
-
-    if plot:
-        plt.plot(range(0, epoch + 1), train_loss_list, "-", label="Train Loss")
-        plt.plot(range(0, epoch + 1), val_loss_list, "-", label="Val Loss")
-        plt.title("Epoch-Loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.show()
-
-    if save:
-        torch.save(best_state_dict, save)
-    return model
+    print_log(f"Finished at epoch {epoch}; best epoch {best['epoch']}: "
+              f"Val Loss = {best['validation_loss']:.5f}", log=log)
+    print_log(f"Saved best weights: {checkpoint}", log=log)
+    return {"completed_epochs": epoch, "best": best, "checkpoint": str(checkpoint)}
 
 
-@torch.no_grad()
-def test_model(model, testset_loader, log=None):
-    model.eval()
-    print_log("--------- Test ---------", log=log)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--output-dir", type=Path, required=True, help="New training run directory")
+    args = parser.parse_args()
+    try:
+        device = device_for(args.device)
+    except (ValueError, RuntimeError) as error:
+        parser.error(str(error))
 
-    start = time.time()
-    y_true, y_pred = predict(model, testset_loader)
-    end = time.time()
-
-    rmse_all, mae_all, mape_all = RMSE_MAE_MAPE(y_true, y_pred)
-    out_str = "All Steps RMSE = %.5f, MAE = %.5f, MAPE = %.5f\n" % (
-        rmse_all,
-        mae_all,
-        mape_all,
-    )
-    out_steps = y_pred.shape[1]
-    for i in range(out_steps):
-        rmse, mae, mape = RMSE_MAE_MAPE(y_true[:, i, :], y_pred[:, i, :])
-        out_str += "Step %d RMSE = %.5f, MAE = %.5f, MAPE = %.5f\n" % (
-            i + 1,
-            rmse,
-            mae,
-            mape,
-        )
-
-    print_log(out_str, log=log, end="")
-    print_log("Inference time: %.2f s" % (end - start), log=log)
-
-
-# TKY reproduction: align the released road graph with the 1843 traffic links.
-def load_tokyo_support(data_path, num_nodes):
-    adjacency_path = os.path.join(data_path, "adj.npy")
-    adjacency = np.load(adjacency_path, allow_pickle=False)
-    if adjacency.shape == (2841, 2841):
-        index_path = Path(__file__).with_name("tokyo_link_idx.csv")
-        road_indices = np.loadtxt(index_path, dtype=np.intp, ndmin=1)
-        if (
-            road_indices.shape != (num_nodes,)
-            or np.unique(road_indices).size != num_nodes
-            or np.any(road_indices < 0)
-            or np.any(road_indices >= adjacency.shape[0])
-        ):
-            raise ValueError(f"Invalid Tokyo road indices in {index_path}")
-        adjacency = adjacency[np.ix_(road_indices, road_indices)]
-
-    if adjacency.shape != (num_nodes, num_nodes):
-        raise ValueError(
-            f"Expected a {num_nodes} x {num_nodes} Tokyo road graph, "
-            f"got {adjacency.shape} from {adjacency_path}"
-        )
-    adjacency = np.asarray(adjacency, dtype=np.float32)
-    if not np.isfinite(adjacency).all():
-        raise ValueError(f"Non-finite values in the Tokyo road graph: {adjacency_path}")
-    return torch.from_numpy(adjacency)
-
-
-def normalize_incoming_weights(support):
-    # ConFormer uses "nvc,vw->nwc", so column w contains the weights received by w.
-    column_sums = support.sum(dim=0, keepdim=True)
-    if not torch.isfinite(column_sums).all() or (column_sums <= 0).any():
-        raise ValueError("Incoming normalization requires a finite positive sum for every column")
-    return support / column_sums
-
-
-def build_training_model(dataset, data_path, model_args, *, normalize_incoming=True):
-    model_args = dict(model_args)
-    if dataset == "TKY":
-        support = load_tokyo_support(data_path, model_args["num_nodes"])
-        if normalize_incoming:
-            support = normalize_incoming_weights(support)
-        model_args["supports"] = [support]
-    return ConFormer(**model_args)
+    config = load_config()
+    seed_everything(SEED)
+    out = args.output_dir.resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    with (out / "run.log").open("w", encoding="utf-8") as log:
+        print_log(f"Run: {out} | dual-axis | {device} | seed {SEED}", log=log)
+        (train_loader, val_loader, _, scaler), _, data_files = load_tokyo(args.data_dir, config, log)
+        model = build_model(args.data_dir, config, device)
+        record_protocol(out, "train", config, scaler, model, device, data_files, Path(__file__))
+        report = train(model, train_loader, val_loader, scaler, config, device, out / "best.pt", log)
+        write_json(out / "train_report.json", report)
 
 
 if __name__ == "__main__":
-    # -------------------------- set running environment ------------------------- #
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--dataset", type=str, default="tky")
-    parser.add_argument("-g", "--gpu_num", type=int, default=1)
-    parser.add_argument("-m", "--mode", type=str, default='train')
-    parser.add_argument(
-        "--normalize-incoming",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Normalize the fixed TKY road graph by incoming weight sums (default: enabled)",
-    )
-    args = parser.parse_args()
-
-    seed = 2024
-    seed_everything(seed)
-    # set_cpu_num(1)
-
-    GPU_ID = args.gpu_num
-    # os.environ["CUDA_VISIBLE_DEVICES"] = f"{GPU_ID}"
-    DEVICE = torch.device("cuda:%s"%GPU_ID if torch.cuda.is_available() else "cpu")
-
-    dataset = args.dataset
-    dataset = dataset.upper()
-    data_path = f"../data/{dataset}"
-    model_name = ConFormer.__name__
-
-    with open(f"{model_name}.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-    cfg = cfg[dataset]
-
-    # -------------------------------- load model -------------------------------- #
-
-    model = build_training_model(
-        dataset, data_path, cfg["model_args"], normalize_incoming=args.normalize_incoming
-    )
-
-    # ------------------------------- make log file ------------------------------ #
-
-    now = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    log_path = f"../logs/"
-    if not os.path.exists(log_path):
-        os.makedirs(log_path)
-    log = os.path.join(log_path, f"{model_name}-{dataset}-{now}.log")
-    log = open(log, "a")
-    log.seek(0)
-    log.truncate()
-
-    # ------------------------------- load dataset ------------------------------- #
-
-    print_log(dataset, log=log)
-    (
-        trainset_loader,
-        valset_loader,
-        testset_loader,
-        SCALER,
-    ) = get_dataloaders_from_index_data(
-        data_path,
-        tod=cfg.get("time_of_day"),
-        dow=cfg.get("day_of_week"),
-        tokyo_external=dataset == "TKY",
-        batch_size=cfg.get("batch_size", 64),
-        log=log,
-        in_steps=cfg.get("in_steps", 12),
-        out_steps=cfg.get("out_steps", 12)
-    )
-    print_log(log=log)
-
-    # --------------------------- set model saving path -------------------------- #
-
-    save_path = f"../saved_models/"
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-
-    if args.mode == 'train':
-        save = os.path.join(save_path, f"{model_name}-{dataset}-{now}.pt")
-    elif args.mode == 'test':
-        model_files = glob.glob(os.path.join(save_path, f"{model_name}-{dataset}-*.pt"))
-        if not model_files:
-            raise ValueError("No saved model found for testing.")
-        latest_model = max(model_files, key=os.path.getctime)
-        print_log(f"Loading the latest model: {latest_model}", log=log)
-        model.load_state_dict(torch.load(latest_model))
-        model = model.to(DEVICE)
-
-    # ---------------------- set loss, optimizer, scheduler ---------------------- #
-
-    if dataset in ("METRLA", "PEMSBAY"):
-        criterion = MaskedMAELoss()
-    elif dataset in ("PEMS03", "PEMS04", "PEMS07", "PEMS08"):
-        criterion = nn.HuberLoss()
-    else:
-        criterion = MaskedMAELoss()
-        # raise ValueError("Unsupported dataset.")
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg["lr"],
-        weight_decay=cfg.get("weight_decay", 0),
-        eps=cfg.get("eps", 1e-8),
-    )
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=cfg["milestones"],
-        gamma=cfg.get("lr_decay_rate", 0.1),
-        verbose=False,
-    )
-
-    # --------------------------- print model structure -------------------------- #
-
-    print_log("---------", model_name, "---------", log=log)
-    print_log(
-        json.dumps(cfg, ensure_ascii=False, indent=4, cls=CustomJSONEncoder), log=log
-    )
-    print_log(
-        summary(
-            model,
-            [
-                cfg["batch_size"],
-                cfg["in_steps"],
-                cfg["num_nodes"],
-                next(iter(trainset_loader))[0].shape[-1],
-            ],
-            verbose=0,  # avoid print twice
-        ),
-        log=log,
-    )
-    print_log(log=log)
-
-    # --------------------------- train and test model --------------------------- #
-
-    print_log(f"Loss: {criterion._get_name()}", log=log)
-    print_log(log=log)
-
-    if args.mode == 'train':
-        model = train(
-            model,
-            trainset_loader,
-            valset_loader,
-            optimizer,
-            scheduler,
-            criterion,
-            clip_grad=cfg.get("clip_grad"),
-            max_epochs=cfg.get("max_epochs", 200),
-            early_stop=cfg.get("early_stop", 10),
-            verbose=1,
-            log=log,
-            save=save,
-        )
-        print_log(f"Saved Model: {save}", log=log)
-
-    test_model(model, testset_loader, log=log)
-
-    log.close()
+    main()

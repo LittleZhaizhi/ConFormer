@@ -1,89 +1,10 @@
-import torch.nn as nn
 import torch
-from torchinfo import summary
-from timm.models.layers import DropPath
-import torch.nn.functional as F
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from torch import nn
+from torch.nn import functional as F
+from timm.layers import DropPath
+from timm.models.vision_transformer import Mlp
 
-
-class AttentionLayer(nn.Module):
-    """Perform attention across the -2 dim (the -1 dim is `model_dim`).
-
-    Make sure the tensor is permuted to correct shape before attention.
-
-    E.g.
-    - Input shape (batch_size, in_steps, num_nodes, model_dim).
-    - Then the attention will be performed across the nodes.
-
-    Also, it supports different src and tgt length.
-
-    But must `src length == K length == V length`.
-
-    """
-
-    def __init__(self, model_dim, num_heads=8, qkv_bias=False, fast=False):
-        super().__init__()
-
-        self.model_dim = model_dim
-        self.num_heads = num_heads
-
-        self.head_dim = model_dim // num_heads
-
-        self.qkv = nn.Linear(model_dim, model_dim * 3, bias=qkv_bias)
-
-        self.out_proj = nn.Linear(model_dim, model_dim)
-
-        self.fast = fast
-
-    def forward(self, x):
-        query, key, value = self.qkv(x).chunk(3, -1)
-        if self.fast:
-            qs = torch.stack(torch.split(query, self.head_dim, dim=-1), dim=-2).flatten(
-                start_dim=0, end_dim=1
-            )
-            ks = torch.stack(torch.split(key, self.head_dim, dim=-1), dim=-2).flatten(
-                start_dim=0, end_dim=1
-            )
-            vs = torch.stack(torch.split(value, self.head_dim, dim=-1), dim=-2).flatten(
-                start_dim=0, end_dim=1
-            )
-
-            qs = nn.functional.normalize(qs, dim=-1)
-            ks = nn.functional.normalize(ks, dim=-1)
-            N = qs.shape[1]
-            batch_size = query.shape[0]
-            length = query.shape[1]
-
-            # numerator
-            kvs = torch.einsum("blhm,blhd->bhmd", ks, vs)
-            attention_num = torch.einsum("bnhm,bhmd->bnhd", qs, kvs)  # [N, H, D]
-            attention_num += N * vs
-
-            # denominator
-            all_ones = torch.ones([ks.shape[1]]).to(ks.device)
-            ks_sum = torch.einsum("blhm,l->bhm", ks, all_ones)
-            attention_normalizer = torch.einsum("bnhm,bhm->bnh", qs, ks_sum)  # [N, H]
-
-            # attentive aggregated results
-            attention_normalizer = torch.unsqueeze(
-                attention_normalizer, len(attention_normalizer.shape)
-            )  # [N, H, 1]
-            attention_normalizer += torch.ones_like(attention_normalizer) * N
-            out = attention_num / attention_normalizer  # [N, H, D]
-            out = torch.unflatten(out, 0, (batch_size, length)).flatten(start_dim=3)
-            out = self.out_proj(out)
-        else:
-            qs = torch.stack(torch.split(query, self.head_dim, dim=-1), dim=2)
-            ks = torch.stack(torch.split(key, self.head_dim, dim=-1), dim=2)
-            vs = torch.stack(torch.split(value, self.head_dim, dim=-1), dim=2)
-            out = (
-                torch.nn.functional.scaled_dot_product_attention(qs, ks, vs)
-                .transpose(-1, -2)
-                .flatten(start_dim=-2)
-            )
-            out = self.out_proj(out)
-
-        return out
+from model.tky_dual_axis import DualAxisAttention
 
 
 def modulate(x, shift, scale):
@@ -98,12 +19,10 @@ class SelfAttentionLayer(nn.Module):
         feed_forward_dim=2048,
         num_heads=8,
         dropout=0,
-        mask=False,
-        fast=False,
     ):
         super().__init__()
 
-        self.attn = AttentionLayer(model_dim, num_heads, mask, fast)
+        self.attn = DualAxisAttention(model_dim, c_dim, num_heads)
         self.ln1 = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
         self.ln2 = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
         self.feed_forward = Mlp(
@@ -116,12 +35,13 @@ class SelfAttentionLayer(nn.Module):
         self.GLN = nn.Sequential(nn.ReLU(), nn.Linear(c_dim, 6 * model_dim, bias=True))
 
     def forward(self, x, c):
+        c = c.unsqueeze(1)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.GLN(
             c
         ).chunk(6, dim=-1)
-        x = x + self.dropout(
-            gate_msa * self.attn(modulate(self.ln1(x), shift_msa, scale_msa))
-        )
+        normalized = modulate(self.ln1(x), shift_msa, scale_msa)
+        attention = self.attn(normalized, c)
+        x = x + self.dropout(gate_msa * attention)
         x = x + self.dropout(
             gate_mlp * self.feed_forward(modulate(self.ln2(x), shift_mlp, scale_mlp))
         )
@@ -200,8 +120,6 @@ class ConFormer(nn.Module):
         tod_dropout=0,
         adp=1,
         supports=1,
-        use_mixed_proj=True,
-        fast=False,
     ):
         super().__init__()
 
@@ -228,11 +146,10 @@ class ConFormer(nn.Module):
         )
         self.num_heads = num_heads
         self.num_layers = num_layers
-        self.use_mixed_proj = use_mixed_proj
         self.adp_dropout = adp_dropout
         self.dow_dropout = dow_dropout
         self.tod_dropout = tod_dropout
-        self.input_proj = nn.Linear(input_dim * self.in_steps, input_embedding_dim)
+        self.input_proj = nn.Linear(input_dim, input_embedding_dim)
 
         self.graph_propagate = GCN(
             self.model_dim - input_embedding_dim,
@@ -255,7 +172,7 @@ class ConFormer(nn.Module):
         if reg_embedding_dim > 0:
             self.reg_embedding = nn.Embedding(2, reg_embedding_dim)
 
-        self.output_proj = nn.Linear(self.model_dim, out_steps * output_dim)
+        self.output_proj = nn.Linear(self.model_dim * in_steps, out_steps * output_dim)
 
         self.attn_layers = nn.ModuleList(
             [
@@ -265,7 +182,6 @@ class ConFormer(nn.Module):
                     feed_forward_dim,
                     num_heads,
                     dropout,
-                    fast=fast,
                 )
                 for i in range(num_layers)
             ]
@@ -301,23 +217,16 @@ class ConFormer(nn.Module):
             reg_emb = self.reg_embedding((x[..., 4].sum(1) > 0).long())
             features.append(reg_emb)
 
-        x = self.input_proj(x[..., : self.input_dim].transpose(1, 2).flatten(2))
-        c = self.graph_propagate(torch.cat(features, dim=-1))
-        x = torch.concat([x] + features, -1)
-        for i, attn in enumerate(self.attn_layers):
+        traffic = x[..., : self.input_dim]
+        node_features = torch.cat(features, dim=-1)
+        c = self.graph_propagate(node_features)
+        history_features = node_features.unsqueeze(1).expand(-1, self.in_steps, -1, -1)
+        x = torch.cat((self.input_proj(traffic), history_features), dim=-1)
+        for attn in self.attn_layers:
             x = attn(x, c)
-        # (batch_size, in_steps, num_nodes, model_dim)
+        x = x.transpose(1, 2).flatten(2)
         out = self.output_proj(x).view(
             batch_size, self.num_nodes, self.out_steps, self.output_dim
         )
         out = out.transpose(1, 2)  # (batch_size, out_steps, num_nodes, output_dim)
         return out
-
-
-if __name__ == "__main__":
-    model = ConFormer(307, 12, 12, num_layers=6)
-    # summary(model, [64, 12, 207, 3])
-    from fvcore.nn import FlopCountAnalysis, flop_count_table
-
-    inputs = torch.rand(1, 12, 307, 96)
-    print(flop_count_table(FlopCountAnalysis(model, inputs)))
